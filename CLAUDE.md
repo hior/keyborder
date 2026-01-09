@@ -72,7 +72,9 @@ BORDER_OPACITY_INNER = 0.05  # Opacity at inner edge (fades inward)
    - Auto-detects source layout (predominantly EN or RU characters)
    - Switches keyboard layout after conversion (EN→RU or RU→EN)
    - Uses `RegisterHotKey` API (not a keyboard hook) — doesn't interfere with dead keys
-   - **Note:** Disabled in terminal windows (cmd, PowerShell, Windows Terminal)
+   - **Terminal support:**
+     - Windows Terminal: select text first (double-click), then press `Pause/Break` (uses Ctrl+Shift+C)
+     - Classic console (cmd): reads last word from console buffer directly
 
 ## Text conversion configuration
 

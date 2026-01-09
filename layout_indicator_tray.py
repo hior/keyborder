@@ -564,9 +564,11 @@ def convert_in_terminal(hwnd):
 
     time.sleep(0.1)
 
-    # Try to copy with Ctrl+C (works if text is selected)
+    # Try to copy with Ctrl+Shift+C (terminal copy shortcut)
     clear_clipboard()
-    send_ctrl_key(VK_C)
+    VK_CONTROL = 0x11
+    VK_SHIFT = 0x10
+    send_two_modifier_combo(VK_CONTROL, VK_SHIFT, VK_C)
     time.sleep(0.2)
 
     word = get_clipboard_text()
@@ -587,8 +589,19 @@ def convert_in_terminal(hwnd):
 
     target_layout = 'ru' if source_layout == 'en' else 'en'
 
-    # In terminal, selected text + typing replaces it
-    # Just type the converted text
+    # Press End to ensure cursor is at end of line
+    VK_END = 0x23
+    send_key_press(VK_END)
+    time.sleep(0.03)
+
+    # Delete the old word with backspaces
+    for _ in range(len(word)):
+        send_key_press(VK_BACKSPACE)
+        time.sleep(0.01)
+
+    time.sleep(0.05)
+
+    # Type the converted text
     type_text(converted)
 
     # Switch layout
@@ -639,9 +652,14 @@ def convert_selected_text():
     """Copy selected text, convert it, and paste back."""
     hwnd = get_foreground_hwnd()
 
-    # Skip terminals - they don't work well with SendInput
+    # Handle console windows differently
     if is_console_window(hwnd):
-        return False
+        if is_classic_console(hwnd):
+            # Classic cmd/powershell - read from console buffer
+            return convert_in_console(hwnd)
+        else:
+            # Windows Terminal - requires text to be selected first
+            return convert_in_terminal(hwnd)
 
     # Regular application mode
     VK_INSERT = 0x2D
