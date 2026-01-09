@@ -1,5 +1,9 @@
 # Keyboard Layout Border Indicator
 
+## Rules
+
+- When functionality changes, update README.md accordingly
+
 ## Overview
 
 Simple Windows utility that shows a colored border around the screen based on the current keyboard layout. **Does NOT use keyboard hooks** — won't break dead keys for US International and other layouts with diacritics.
