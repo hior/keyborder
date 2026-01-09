@@ -63,7 +63,9 @@ Right-click the tray icon to:
 
 **Example:** Type `ghbdtn` (with EN layout) → press Pause → get `привет` (RU layout active)
 
-> **Note:** Text conversion is disabled in terminal windows (cmd, PowerShell, Windows Terminal)
+**Terminal support:**
+- **Windows Terminal:** Select text first (double-click on word), then press `Pause/Break`
+- **Classic console (cmd):** Just press `Pause/Break` — reads last word from console buffer
 
 ## Configuration
 
