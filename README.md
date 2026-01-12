@@ -12,7 +12,7 @@ Windows utility that shows a colored border around the screen based on the curre
 - **System tray icon** — colored icon matches current layout, right-click menu
 - **Text conversion** (Pause/Break) — convert selected text between EN↔RU layouts
   - Works like Punto Switcher but without keyboard hooks
-  - Auto-selects to space boundary if nothing is selected (includes punctuation like `;` `,` etc.)
+  - Auto-selects to space boundary if nothing is selected, correctly handling punctuation (`;`, `,`, `.`, `'`, etc. are treated as word glue)
   - Automatically switches keyboard layout after conversion
 - **Fullscreen-aware** — border hides in fullscreen apps
 

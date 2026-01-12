@@ -654,10 +654,12 @@ def convert_in_console(hwnd):
 
 
 def select_to_space_boundary():
-    """Select backwards to space boundary using fast word selection first.
+    """Select backwards to space boundary, including punctuation.
 
-    Strategy: Use Ctrl+Shift+Left (word selection) repeatedly, which is faster
-    than character-by-character. Stop when we hit a space at the beginning.
+    Strategy:
+    1. Select word with Ctrl+Shift+Left
+    2. Peek one char left - if it's punctuation, continue selecting
+    3. If it's space/newline, we're done
     """
     VK_CONTROL = 0x11
     VK_SHIFT = 0x10
@@ -665,53 +667,52 @@ def select_to_space_boundary():
     VK_RIGHT = 0x27
     VK_INSERT = 0x2D
 
-    max_words = 10  # Safety limit
+    # Punctuation that can "glue" words together (typed in wrong layout)
+    GLUE_PUNCTUATION = set(';,.\'"[]{}/<>?!@#$%^&*()-_=+`~')
 
     clear_clipboard()
-    prev_len = 0
-    text = None
+    max_iterations = 10
 
-    for i in range(max_words):
-        # Extend selection by one word (Ctrl+Shift+Left)
+    for _ in range(max_iterations):
+        # Select word with Ctrl+Shift+Left
         send_two_modifier_combo(VK_CONTROL, VK_SHIFT, VK_LEFT)
         time.sleep(0.03)
 
-        # Copy current selection
+        # Copy selection
         send_ctrl_key(VK_INSERT)
         time.sleep(0.05)
 
-        new_text = get_clipboard_text()
+        text = get_clipboard_text()
+        if not text:
+            return None
 
-        if not new_text:
-            if i == 0:
-                return None
-            break
+        # Peek one more character to the left
+        send_key_combo(VK_SHIFT, VK_LEFT)
+        time.sleep(0.02)
 
-        # Check if selection stopped growing (hit beginning)
-        if len(new_text) == prev_len:
-            break
+        send_ctrl_key(VK_INSERT)
+        time.sleep(0.03)
 
-        prev_len = len(new_text)
-        text = new_text
+        peeked = get_clipboard_text()
 
-        # Check if we hit a space/newline at the beginning
-        if new_text[0] in ' \t\n\r':
-            # We selected one word too many - need to trim
-            # Deselect by moving selection end back word by word until no leading space
-            # Simpler: just strip the leading whitespace from result
-            # But then selection won't match...
-            # For now, just use the text without leading space
-            text = new_text.lstrip(' \t\n\r')
+        if not peeked or len(peeked) == len(text):
+            # Couldn't extend - we're at the beginning
+            return text.strip() if text else None
 
-            # Adjust selection to match: deselect the extra space
-            # Move right by the number of stripped characters
-            stripped_count = len(new_text) - len(text)
-            for _ in range(stripped_count):
-                send_key_combo(VK_SHIFT, VK_RIGHT)
-                time.sleep(0.01)
-            break
+        first_char = peeked[0]
 
-    return text
+        if first_char in GLUE_PUNCTUATION:
+            # Punctuation found - continue selecting (keep the extended selection)
+            continue
+        else:
+            # Space or letter - undo the peek (deselect one char)
+            send_key_combo(VK_SHIFT, VK_RIGHT)
+            time.sleep(0.02)
+            return text.strip() if text else None
+
+    # Safety: return whatever we have
+    text = get_clipboard_text()
+    return text.strip() if text else None
 
 
 def convert_selected_text():
