@@ -373,13 +373,18 @@ def send_input_keys(keys):
 def send_key_combo(modifier_vk, key_vk):
     """Send modifier+key combination using SendInput."""
     KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+
+    # Extended keys: arrows, Insert, Delete, Home, End, Page Up/Down
+    extended_keys = {0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22}
+    key_flags = KEYEVENTF_EXTENDEDKEY if key_vk in extended_keys else 0
 
     # Send all 4 events at once for atomicity
     keys = [
-        (modifier_vk, 0),           # Modifier down
-        (key_vk, 0),                # Key down
-        (key_vk, KEYEVENTF_KEYUP),  # Key up
-        (modifier_vk, KEYEVENTF_KEYUP),  # Modifier up
+        (modifier_vk, 0),                        # Modifier down
+        (key_vk, key_flags),                     # Key down
+        (key_vk, key_flags | KEYEVENTF_KEYUP),   # Key up
+        (modifier_vk, KEYEVENTF_KEYUP),          # Modifier up
     ]
     return send_input_keys(keys)
 
@@ -648,6 +653,67 @@ def convert_in_console(hwnd):
     return True
 
 
+def select_to_space_boundary():
+    """Select backwards to space boundary using fast word selection first.
+
+    Strategy: Use Ctrl+Shift+Left (word selection) repeatedly, which is faster
+    than character-by-character. Stop when we hit a space at the beginning.
+    """
+    VK_CONTROL = 0x11
+    VK_SHIFT = 0x10
+    VK_LEFT = 0x25
+    VK_RIGHT = 0x27
+    VK_INSERT = 0x2D
+
+    max_words = 10  # Safety limit
+
+    clear_clipboard()
+    prev_len = 0
+    text = None
+
+    for i in range(max_words):
+        # Extend selection by one word (Ctrl+Shift+Left)
+        send_two_modifier_combo(VK_CONTROL, VK_SHIFT, VK_LEFT)
+        time.sleep(0.03)
+
+        # Copy current selection
+        send_ctrl_key(VK_INSERT)
+        time.sleep(0.05)
+
+        new_text = get_clipboard_text()
+
+        if not new_text:
+            if i == 0:
+                return None
+            break
+
+        # Check if selection stopped growing (hit beginning)
+        if len(new_text) == prev_len:
+            break
+
+        prev_len = len(new_text)
+        text = new_text
+
+        # Check if we hit a space/newline at the beginning
+        if new_text[0] in ' \t\n\r':
+            # We selected one word too many - need to trim
+            # Deselect by moving selection end back word by word until no leading space
+            # Simpler: just strip the leading whitespace from result
+            # But then selection won't match...
+            # For now, just use the text without leading space
+            text = new_text.lstrip(' \t\n\r')
+
+            # Adjust selection to match: deselect the extra space
+            # Move right by the number of stripped characters
+            stripped_count = len(new_text) - len(text)
+            for _ in range(stripped_count):
+                send_key_combo(VK_SHIFT, VK_RIGHT)
+                time.sleep(0.01)
+            break
+
+    return text
+
+
 def convert_selected_text():
     """Copy selected text, convert it, and paste back."""
     hwnd = get_foreground_hwnd()
@@ -663,9 +729,6 @@ def convert_selected_text():
 
     # Regular application mode
     VK_INSERT = 0x2D
-    VK_CONTROL = 0x11
-    VK_SHIFT = 0x10
-    VK_LEFT = 0x25
 
     # Small delay to ensure modifiers from hotkey are released
     time.sleep(0.05)
@@ -680,17 +743,9 @@ def convert_selected_text():
     # Get copied text from clipboard
     selected_text = get_clipboard_text()
 
-    # If nothing selected, try to select last word
+    # If nothing selected, select backwards to space boundary
     if not selected_text:
-        # Select last word with Ctrl+Shift+Left
-        send_two_modifier_combo(VK_CONTROL, VK_SHIFT, VK_LEFT)
-        time.sleep(0.03)
-
-        # Copy it (selection stays)
-        send_ctrl_key(VK_INSERT)
-        time.sleep(0.05)
-
-        selected_text = get_clipboard_text()
+        selected_text = select_to_space_boundary()
 
     if not selected_text:
         return False

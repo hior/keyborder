@@ -72,7 +72,7 @@ BORDER_OPACITY_INNER = 0.05  # Opacity at inner edge (fades inward)
    - Select text in any application (or place cursor after a word)
    - Press `Pause/Break`
    - If text is selected: copies, converts, pastes back
-   - If nothing selected: automatically selects last word (Ctrl+Shift+Left), then converts
+   - If nothing selected: automatically selects to space boundary (character by character with Shift+Left), includes punctuation like `;`, `,`, etc.
    - Auto-detects source layout (predominantly EN or RU characters)
    - Switches keyboard layout after conversion (EN→RU or RU→EN)
    - Uses `RegisterHotKey` API (not a keyboard hook) — doesn't interfere with dead keys
