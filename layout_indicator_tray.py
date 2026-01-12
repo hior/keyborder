@@ -697,7 +697,8 @@ def select_to_space_boundary():
 
         if not peeked or len(peeked) == len(text):
             # Couldn't extend - we're at the beginning
-            return text.strip() if text else None
+            # Use lstrip to preserve trailing spaces
+            return text.lstrip() if text else None
 
         first_char = peeked[0]
 
@@ -708,11 +709,13 @@ def select_to_space_boundary():
             # Space or letter - undo the peek (deselect one char)
             send_key_combo(VK_SHIFT, VK_RIGHT)
             time.sleep(0.02)
-            return text.strip() if text else None
+            # Use lstrip to preserve trailing spaces
+            return text.lstrip() if text else None
 
     # Safety: return whatever we have
     text = get_clipboard_text()
-    return text.strip() if text else None
+    # Use lstrip to preserve trailing spaces
+    return text.lstrip() if text else None
 
 
 def convert_selected_text():
