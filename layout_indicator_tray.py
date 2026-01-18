@@ -16,6 +16,40 @@ import tkinter as tk
 import threading
 import sys
 import time
+import traceback
+import os
+
+# Setup logging to file for crash debugging
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'layout_indicator.log')
+
+def log_error(msg, flush=True):
+    """Log error to file and console."""
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{timestamp}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+            if flush:
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+    except Exception:
+        pass
+
+def global_exception_handler(exc_type, exc_value, exc_tb):
+    """Global exception handler to catch unhandled exceptions."""
+    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    log_error(f"UNHANDLED EXCEPTION:\n{error_msg}")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = global_exception_handler
+
+def thread_exception_handler(args):
+    """Handler for exceptions in threads."""
+    error_msg = ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    log_error(f"THREAD EXCEPTION in {args.thread.name}:\n{error_msg}")
+
+threading.excepthook = thread_exception_handler
 
 try:
     import pystray
@@ -75,6 +109,10 @@ HOTKEY_ID_PAUSE = 1
 HOTKEY_ID_SETTINGS = 2
 WM_HOTKEY = 0x0312
 
+# Lock to prevent multiple simultaneous conversions
+_conversion_lock = threading.Lock()
+_conversion_in_progress = False
+
 # Layout HKLs for switching (use your preferred EN layout)
 HKL_EN = 0x04090409  # US standard (change to 0xF0010409 for US-Intl)
 HKL_RU = 0x04190419  # Russian
@@ -82,27 +120,51 @@ HKL_RU = 0x04190419  # Russian
 
 def get_foreground_hwnd():
     """Get handle of foreground window."""
-    return user32.GetForegroundWindow()
+    try:
+        return user32.GetForegroundWindow()
+    except Exception as e:
+        log_error(f"get_foreground_hwnd error: {e}")
+        return None
+
+
+def is_valid_hwnd(hwnd):
+    """Check if hwnd is valid."""
+    if not hwnd:
+        return False
+    try:
+        return user32.IsWindow(hwnd)
+    except Exception:
+        return False
 
 
 def get_keyboard_layout_for_hwnd(hwnd):
     """Get keyboard layout info for a window: (color, name)."""
-    thread_id = user32.GetWindowThreadProcessId(hwnd, None)
-    hkl = user32.GetKeyboardLayout(thread_id)
+    if not is_valid_hwnd(hwnd):
+        return DEFAULT_COLOR
 
-    # HKL is a handle - treat as unsigned 32-bit
-    hkl_value = hkl & 0xFFFFFFFF
+    try:
+        thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+        if not thread_id:
+            return DEFAULT_COLOR
 
-    # Try matching by full HKL value
-    if hkl_value in KLID_COLORS:
-        return KLID_COLORS[hkl_value]
+        hkl = user32.GetKeyboardLayout(thread_id)
 
-    # Fallback to language ID only
-    lang_id = hkl_value & 0xFFFF
-    if lang_id in LANG_COLORS:
-        return LANG_COLORS[lang_id]
+        # HKL is a handle - treat as unsigned 32-bit
+        hkl_value = hkl & 0xFFFFFFFF
 
-    return DEFAULT_COLOR
+        # Try matching by full HKL value
+        if hkl_value in KLID_COLORS:
+            return KLID_COLORS[hkl_value]
+
+        # Fallback to language ID only
+        lang_id = hkl_value & 0xFFFF
+        if lang_id in LANG_COLORS:
+            return LANG_COLORS[lang_id]
+
+        return DEFAULT_COLOR
+    except Exception as e:
+        log_error(f"get_keyboard_layout_for_hwnd error: {e}")
+        return DEFAULT_COLOR
 
 
 def get_keyboard_layout():
@@ -132,25 +194,41 @@ def get_all_monitors():
     """Get work areas for all monitors."""
     monitors = []
 
-    # Callback function for EnumDisplayMonitors
-    MONITORENUMPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_bool,
-        ctypes.c_void_p,  # hMonitor
-        ctypes.c_void_p,  # hdcMonitor
-        ctypes.POINTER(RECT),  # lprcMonitor
-        ctypes.c_void_p   # dwData
-    )
+    try:
+        # Callback function for EnumDisplayMonitors
+        MONITORENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool,
+            ctypes.c_void_p,  # hMonitor
+            ctypes.c_void_p,  # hdcMonitor
+            ctypes.POINTER(RECT),  # lprcMonitor
+            ctypes.c_void_p   # dwData
+        )
 
-    def monitor_enum_callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
-        info = MONITORINFO()
-        info.cbSize = ctypes.sizeof(MONITORINFO)
-        if user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
-            work = info.rcWork
-            monitors.append((work.left, work.top, work.right, work.bottom))
-        return True
+        def monitor_enum_callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+            try:
+                info = MONITORINFO()
+                info.cbSize = ctypes.sizeof(MONITORINFO)
+                if user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
+                    work = info.rcWork
+                    monitors.append((work.left, work.top, work.right, work.bottom))
+            except Exception as e:
+                log_error(f"monitor_enum_callback error: {e}")
+            return True
 
-    callback = MONITORENUMPROC(monitor_enum_callback)
-    user32.EnumDisplayMonitors(None, None, callback, 0)
+        callback = MONITORENUMPROC(monitor_enum_callback)
+        user32.EnumDisplayMonitors(None, None, callback, 0)
+    except Exception as e:
+        log_error(f"get_all_monitors error: {e}")
+
+    # Return at least primary monitor if enumeration failed
+    if not monitors:
+        try:
+            rect = RECT()
+            SPI_GETWORKAREA = 0x0030
+            ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+            monitors.append((rect.left, rect.top, rect.right, rect.bottom))
+        except Exception:
+            monitors.append((0, 0, 1920, 1080))  # Fallback
 
     return monitors
 
@@ -165,34 +243,38 @@ def get_work_area():
 
 def is_fullscreen(hwnd):
     """Check if the given window is fullscreen."""
-    if not hwnd:
+    if not is_valid_hwnd(hwnd):
         return False
 
-    # Get window rect
-    window_rect = RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+    try:
+        # Get window rect
+        window_rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+            return False
+
+        # Get the monitor this window is on
+        MONITOR_DEFAULTTONEAREST = 2
+        hMonitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not hMonitor:
+            return False
+
+        # Get monitor info
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
+            return False
+
+        # Compare window rect with monitor rect (full screen, not work area)
+        mon = info.rcMonitor
+        win = window_rect
+
+        return (win.left <= mon.left and
+                win.top <= mon.top and
+                win.right >= mon.right and
+                win.bottom >= mon.bottom)
+    except Exception as e:
+        log_error(f"is_fullscreen error: {e}")
         return False
-
-    # Get the monitor this window is on
-    MONITOR_DEFAULTTONEAREST = 2
-    hMonitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
-    if not hMonitor:
-        return False
-
-    # Get monitor info
-    info = MONITORINFO()
-    info.cbSize = ctypes.sizeof(MONITORINFO)
-    if not user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
-        return False
-
-    # Compare window rect with monitor rect (full screen, not work area)
-    mon = info.rcMonitor
-    win = window_rect
-
-    return (win.left <= mon.left and
-            win.top <= mon.top and
-            win.right >= mon.right and
-            win.bottom >= mon.bottom)
 
 
 # ============================================
@@ -722,115 +804,188 @@ def select_to_space_boundary():
 
 def convert_selected_text():
     """Copy selected text, convert it, and paste back."""
-    hwnd = get_foreground_hwnd()
+    global _conversion_in_progress
 
-    # Handle console windows differently
-    if is_console_window(hwnd):
-        if is_classic_console(hwnd):
-            # Classic cmd/powershell - read from console buffer
-            return convert_in_console(hwnd)
-        else:
-            # Windows Terminal - requires text to be selected first
-            return convert_in_terminal(hwnd)
-
-    # Regular application mode
-    VK_INSERT = 0x2D
-
-    # Small delay to ensure modifiers from hotkey are released
-    time.sleep(0.05)
-
-    # Clear clipboard first to detect if anything gets copied
-    clear_clipboard()
-
-    # Send Ctrl+Insert to copy selection
-    send_ctrl_key(VK_INSERT)
-    time.sleep(0.08)  # Wait for copy to complete
-
-    # Get copied text from clipboard
-    selected_text = get_clipboard_text()
-
-    # If nothing selected, select backwards to space boundary
-    if not selected_text:
-        selected_text = select_to_space_boundary()
-
-    if not selected_text:
+    # Prevent multiple simultaneous conversions
+    if not _conversion_lock.acquire(blocking=False):
+        log_error("convert_selected_text: SKIPPED (already in progress)")
         return False
 
-    # Detect source layout and convert
-    source_layout = detect_layout(selected_text)
-    converted = convert_text(selected_text)
-
-    if converted == selected_text:
+    if _conversion_in_progress:
+        _conversion_lock.release()
+        log_error("convert_selected_text: SKIPPED (flag set)")
         return False
 
-    target_layout = 'ru' if source_layout == 'en' else 'en'
+    _conversion_in_progress = True
+    log_error("convert_selected_text: START")
 
-    # Put converted text to clipboard
-    if not set_clipboard_text(converted):
+    try:
+        hwnd = get_foreground_hwnd()
+        log_error(f"convert_selected_text: hwnd={hwnd}")
+
+        # Handle console windows differently
+        if is_console_window(hwnd):
+            if is_classic_console(hwnd):
+                log_error("convert_selected_text: classic console mode")
+                return convert_in_console(hwnd)
+            else:
+                log_error("convert_selected_text: terminal mode")
+                return convert_in_terminal(hwnd)
+
+        # Regular application mode
+        log_error("convert_selected_text: regular app mode")
+        VK_INSERT = 0x2D
+
+        # Small delay to ensure modifiers from hotkey are released
+        time.sleep(0.05)
+
+        # Clear clipboard first to detect if anything gets copied
+        log_error("convert_selected_text: clearing clipboard")
+        clear_clipboard()
+
+        # Send Ctrl+X to cut selection (copies and deletes in one step)
+        log_error("convert_selected_text: sending Ctrl+X")
+        VK_X = 0x58
+        send_ctrl_key(VK_X)
+        time.sleep(0.08)  # Wait for cut to complete
+
+        # Get cut text from clipboard
+        log_error("convert_selected_text: getting clipboard")
+        selected_text = get_clipboard_text()
+        log_error(f"convert_selected_text: clipboard text = {repr(selected_text)[:50] if selected_text else None}")
+
+        # If nothing was selected/cut, select backwards to space boundary
+        if not selected_text:
+            log_error("convert_selected_text: selecting to space boundary")
+            selected_text = select_to_space_boundary()
+            log_error(f"convert_selected_text: selected = {repr(selected_text)[:50] if selected_text else None}")
+
+            if selected_text:
+                # Delete selected text with backspaces
+                text_length = len(selected_text)
+                log_error(f"convert_selected_text: deleting {text_length} chars with backspace")
+                VK_BACKSPACE = 0x08
+                for _ in range(text_length):
+                    send_key_press(VK_BACKSPACE)
+                    time.sleep(0.005)
+                time.sleep(0.05)
+
+        if not selected_text:
+            log_error("convert_selected_text: no text, returning False")
+            return False
+
+        # Detect source layout and convert
+        source_layout = detect_layout(selected_text)
+        converted = convert_text(selected_text)
+        log_error(f"convert_selected_text: {source_layout} -> converted")
+
+        if converted == selected_text:
+            log_error("convert_selected_text: no change, returning False")
+            return False
+
+        target_layout = 'ru' if source_layout == 'en' else 'en'
+
+        # Put converted text to clipboard and paste
+        log_error("convert_selected_text: pasting converted text")
+        set_clipboard_text(converted)
+        VK_V = 0x56
+        send_ctrl_key(VK_V)
+
+        # Switch keyboard layout
+        log_error(f"convert_selected_text: switching layout to {target_layout}")
+        time.sleep(0.02)
+        switch_keyboard_layout(target_layout)
+        log_error("convert_selected_text: DONE")
+        return True
+    except Exception as e:
+        log_error(f"convert_selected_text: EXCEPTION {e}")
         return False
-
-    # Send Ctrl+V to paste
-    VK_V = 0x56
-    send_ctrl_key(VK_V)
-
-    # Switch keyboard layout
-    time.sleep(0.02)
-    switch_keyboard_layout(target_layout)
-    return True
+    finally:
+        _conversion_in_progress = False
+        _conversion_lock.release()
+        log_error("convert_selected_text: lock released")
 
 
 class BorderLayer:
     """A single layer of the gradient border."""
 
     def __init__(self, master, x, y, w, h, color, alpha):
-        self.window = tk.Toplevel(master)
-        self.window.withdraw()
-        self.window.overrideredirect(True)
-        self.window.attributes('-topmost', True)
-        self.window.attributes('-alpha', alpha)
+        self.window = None
+        self.canvas = None
         self.base_alpha = alpha
 
-        self.window.geometry(f'{w}x{h}+{x}+{y}')
+        try:
+            self.window = tk.Toplevel(master)
+            self.window.withdraw()
+            self.window.overrideredirect(True)
+            self.window.attributes('-topmost', True)
+            self.window.attributes('-alpha', alpha)
 
-        self.canvas = tk.Canvas(self.window, width=w, height=h,
-                               highlightthickness=0, bg=color)
-        self.canvas.pack(fill='both', expand=True)
+            self.window.geometry(f'{w}x{h}+{x}+{y}')
 
-        self.window.deiconify()
-        self._make_click_through()
+            self.canvas = tk.Canvas(self.window, width=w, height=h,
+                                   highlightthickness=0, bg=color)
+            self.canvas.pack(fill='both', expand=True)
+
+            self.window.deiconify()
+            self._make_click_through()
+        except Exception as e:
+            log_error(f"BorderLayer.__init__ error: {e}")
 
     def _make_click_through(self):
-        self.window.update()
-        hwnd = int(self.window.wm_frame(), 16)
-
-        GWL_EXSTYLE = -20
-        WS_EX_LAYERED = 0x80000
-        WS_EX_TRANSPARENT = 0x20
-        WS_EX_TOOLWINDOW = 0x80
-        WS_EX_NOACTIVATE = 0x08000000
-
+        if not self.window:
+            return
         try:
-            set_window_long = user32.SetWindowLongPtrW
-        except AttributeError:
-            set_window_long = user32.SetWindowLongW
+            self.window.update()
+            hwnd = int(self.window.wm_frame(), 16)
 
-        try:
-            get_window_long = user32.GetWindowLongPtrW
-        except AttributeError:
-            get_window_long = user32.GetWindowLongW
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x80000
+            WS_EX_TRANSPARENT = 0x20
+            WS_EX_TOOLWINDOW = 0x80
+            WS_EX_NOACTIVATE = 0x08000000
 
-        styles = get_window_long(hwnd, GWL_EXSTYLE)
-        styles |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-        set_window_long(hwnd, GWL_EXSTYLE, styles)
+            try:
+                set_window_long = user32.SetWindowLongPtrW
+            except AttributeError:
+                set_window_long = user32.SetWindowLongW
+
+            try:
+                get_window_long = user32.GetWindowLongPtrW
+            except AttributeError:
+                get_window_long = user32.GetWindowLongW
+
+            styles = get_window_long(hwnd, GWL_EXSTYLE)
+            styles |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            set_window_long(hwnd, GWL_EXSTYLE, styles)
+        except Exception as e:
+            print(f"Warning: Failed to make window click-through: {e}")
 
     def set_color(self, color):
-        self.canvas.configure(bg=color)
+        if not self.canvas:
+            return
+        try:
+            self.canvas.configure(bg=color)
+        except (tk.TclError, RuntimeError):
+            pass  # Window may be destroyed
 
     def set_alpha(self, alpha):
-        self.window.attributes('-alpha', alpha)
+        if not self.window:
+            return
+        try:
+            self.window.attributes('-alpha', alpha)
+        except (tk.TclError, RuntimeError):
+            pass  # Window may be destroyed
 
     def destroy(self):
-        self.window.destroy()
+        if not self.window:
+            return
+        try:
+            self.window.destroy()
+        except (tk.TclError, RuntimeError):
+            pass  # Already destroyed
+        self.window = None
+        self.canvas = None
 
 
 class BorderWindow:
@@ -899,12 +1054,18 @@ class LayoutIndicator:
         self.current_monitors = None  # Track monitor configuration
         self.hotkey_registered = False
         self.hotkey_thread = None
+        self._pending_actions = []  # Thread-safe action queue
+        self._borders_lock = threading.Lock()  # Protect borders list
+        self._last_logged_hwnd = None  # For debugging window switches
 
         # Create borders for all monitors
         self._create_borders()
 
         # Start layout checking
         self._check_layout()
+
+        # Start processing pending actions from other threads
+        self._process_pending_actions()
 
         # Setup system tray if available
         if HAS_TRAY:
@@ -914,67 +1075,130 @@ class LayoutIndicator:
         if ENABLE_TEXT_CONVERSION:
             self._setup_hotkey()
 
+    def _schedule_action(self, action):
+        """Schedule an action to run on the main tkinter thread."""
+        self._pending_actions.append(action)
+
+    def _process_pending_actions(self):
+        """Process pending actions from other threads (runs on main thread)."""
+        if not self.running:
+            return
+
+        while self._pending_actions:
+            try:
+                action = self._pending_actions.pop(0)
+                action()
+            except Exception as e:
+                print(f"Error in pending action: {e}")
+
+        self.root.after(50, self._process_pending_actions)
+
     def _create_borders(self):
         """Create border windows for all monitors."""
-        # Destroy existing borders
-        for border in self.borders:
-            border.destroy()
-        self.borders = []
+        with self._borders_lock:
+            # Destroy existing borders
+            for border in self.borders:
+                try:
+                    border.destroy()
+                except Exception as e:
+                    print(f"Error destroying border: {e}")
+            self.borders = []
 
-        # Determine which edges to show
-        edges = ['top', 'bottom', 'left', 'right'] if SHOW_ALL_EDGES else ['bottom']
+            # Determine which edges to show
+            edges = ['top', 'bottom', 'left', 'right'] if SHOW_ALL_EDGES else ['bottom']
 
-        # Get all monitors and create borders for each
-        self.current_monitors = get_all_monitors()
-        print(f"Found {len(self.current_monitors)} monitor(s)")
+            # Get all monitors and create borders for each
+            self.current_monitors = get_all_monitors()
+            print(f"Found {len(self.current_monitors)} monitor(s)")
 
-        color = self.current_color or DEFAULT_COLOR[0]
-        for work_area in self.current_monitors:
-            for edge in edges:
-                border = BorderWindow(self.root, edge, color, work_area)
-                # Respect current visibility state
-                if not self.borders_visible or self.fullscreen_hidden:
-                    border.set_visible(False)
-                self.borders.append(border)
+            color = self.current_color or DEFAULT_COLOR[0]
+            for work_area in self.current_monitors:
+                for edge in edges:
+                    try:
+                        border = BorderWindow(self.root, edge, color, work_area)
+                        # Respect current visibility state
+                        if not self.borders_visible or self.fullscreen_hidden:
+                            border.set_visible(False)
+                        self.borders.append(border)
+                    except Exception as e:
+                        print(f"Error creating border {edge}: {e}")
     
     def _check_layout(self):
         """Periodically check keyboard layout."""
         if not self.running:
             return
 
-        # Check if monitor configuration changed
-        monitors = get_all_monitors()
-        if monitors != self.current_monitors:
-            print("Monitor configuration changed, recreating borders...")
-            self._create_borders()
+        try:
+            # Check if monitor configuration changed
+            monitors = get_all_monitors()
+            if monitors != self.current_monitors:
+                print("Monitor configuration changed, recreating borders...")
+                self._create_borders()
 
-        hwnd = get_foreground_hwnd()
-        fullscreen = is_fullscreen(hwnd)
+            hwnd = get_foreground_hwnd()
+            window_changed = hwnd and self._last_logged_hwnd != hwnd
 
-        # Hide borders in fullscreen apps
-        if fullscreen and not self.fullscreen_hidden:
-            self.fullscreen_hidden = True
-            for border in self.borders:
-                border.set_visible(False)
-        elif not fullscreen and self.fullscreen_hidden:
-            self.fullscreen_hidden = False
-            if self.borders_visible:  # Respect manual toggle
-                for border in self.borders:
-                    border.set_visible(True)
+            # Get window class for debugging
+            current_class = ""
+            try:
+                class_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, class_buf, 256)
+                current_class = class_buf.value
+            except Exception:
+                pass
 
-        color, name = get_keyboard_layout_for_hwnd(hwnd)
+            # Log window info for debugging crashes (only on window change)
+            if window_changed:
+                self._last_logged_hwnd = hwnd
+                try:
+                    window_title = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(hwnd, window_title, 256)
+                    log_error(f"Window: hwnd={hwnd}, class={current_class}, title={window_title.value[:50]}")
+                except Exception:
+                    pass
 
-        if color != self.current_color:
-            self.current_color = color
-            self.current_name = name
+            # Skip fullscreen check for WPF apps (HwndWrapper) - may cause issues
+            if "HwndWrapper" in current_class:
+                fullscreen = False
+            else:
+                fullscreen = is_fullscreen(hwnd)
 
-            for border in self.borders:
-                border.set_color(color)
+            color, name = get_keyboard_layout_for_hwnd(hwnd)
 
-            # Update tray icon color
-            if self.tray_icon and HAS_TRAY:
-                self._update_tray_icon(color, name)
-        
+            # Hide borders in fullscreen apps
+            with self._borders_lock:
+                if fullscreen and not self.fullscreen_hidden:
+                    self.fullscreen_hidden = True
+                    for border in self.borders:
+                        try:
+                            border.set_visible(False)
+                        except Exception:
+                            pass
+                elif not fullscreen and self.fullscreen_hidden:
+                    self.fullscreen_hidden = False
+                    if self.borders_visible:  # Respect manual toggle
+                        for border in self.borders:
+                            try:
+                                border.set_visible(True)
+                            except Exception:
+                                pass
+
+                if color != self.current_color:
+                    self.current_color = color
+                    self.current_name = name
+
+                    for border in self.borders:
+                        try:
+                            border.set_color(color)
+                        except Exception:
+                            pass
+
+                    # Update tray icon color
+                    if self.tray_icon and HAS_TRAY:
+                        self._update_tray_icon(color, name)
+        except Exception as e:
+            log_error(f"Error in _check_layout: {e}")
+
         self.root.after(CHECK_INTERVAL_MS, self._check_layout)
 
     def _setup_hotkey(self):
@@ -1049,22 +1273,38 @@ class LayoutIndicator:
     def _setup_tray(self):
         """Setup system tray icon."""
         def on_quit(icon, item):
-            self.running = False
-            icon.stop()
-            self.root.quit()
-        
+            # Schedule quit on main thread to avoid tkinter threading issues
+            def do_quit():
+                self.running = False
+                try:
+                    icon.stop()
+                except Exception:
+                    pass
+                try:
+                    self.root.quit()
+                except Exception:
+                    pass
+            self._schedule_action(do_quit)
+
         def toggle_borders(icon, item):
-            self.borders_visible = not self.borders_visible
-            # Only actually toggle if not hidden due to fullscreen
-            if not self.fullscreen_hidden:
-                for border in self.borders:
-                    border.set_visible(self.borders_visible)
-        
+            # Schedule toggle on main thread to avoid tkinter threading issues
+            def do_toggle():
+                self.borders_visible = not self.borders_visible
+                # Only actually toggle if not hidden due to fullscreen
+                if not self.fullscreen_hidden:
+                    with self._borders_lock:
+                        for border in self.borders:
+                            try:
+                                border.set_visible(self.borders_visible)
+                            except Exception:
+                                pass
+            self._schedule_action(do_toggle)
+
         menu = pystray.Menu(
             pystray.MenuItem('Toggle Borders', toggle_borders),
             pystray.MenuItem('Exit', on_quit)
         )
-        
+
         image = self._create_tray_image(self.current_color or DEFAULT_COLOR[0])
         self.tray_icon = pystray.Icon(
             'layout_indicator',
@@ -1072,7 +1312,7 @@ class LayoutIndicator:
             f'Layout: {self.current_name or "?"}',
             menu
         )
-        
+
         # Run tray in separate thread
         tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
         tray_thread.start()
@@ -1080,8 +1320,11 @@ class LayoutIndicator:
     def _update_tray_icon(self, color, name):
         """Update tray icon with new color."""
         if self.tray_icon:
-            self.tray_icon.icon = self._create_tray_image(color)
-            self.tray_icon.title = f'Layout: {name}'
+            try:
+                self.tray_icon.icon = self._create_tray_image(color)
+                self.tray_icon.title = f'Layout: {name}'
+            except Exception:
+                pass  # Tray icon may be stopping
     
     def run(self):
         """Start the main loop."""
@@ -1095,10 +1338,17 @@ class LayoutIndicator:
     def cleanup(self):
         """Clean up resources."""
         self.running = False
-        for border in self.borders:
-            border.destroy()
+        with self._borders_lock:
+            for border in self.borders:
+                try:
+                    border.destroy()
+                except Exception:
+                    pass
         if self.tray_icon:
-            self.tray_icon.stop()
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
 
 
 def main():
@@ -1106,14 +1356,20 @@ def main():
         print("This script only works on Windows!")
         sys.exit(1)
 
+    log_error("=== Layout Indicator Starting ===")
     print("Layout Indicator Started")
     print(f"Border: {BORDER_THICKNESS}px, Opacity gradient: {BORDER_OPACITY_OUTER} -> {BORDER_OPACITY_INNER}")
     if ENABLE_TEXT_CONVERSION:
         print("Text conversion: Pause/Break or Settings key (select text first)")
     print("Right-click tray icon to exit" if HAS_TRAY else "Press Ctrl+C to exit")
+    print(f"Log file: {LOG_FILE}")
 
-    app = LayoutIndicator()
-    app.run()
+    try:
+        app = LayoutIndicator()
+        app.run()
+    except Exception as e:
+        log_error(f"FATAL ERROR in main: {e}\n{traceback.format_exc()}")
+        raise
 
 
 if __name__ == '__main__':
