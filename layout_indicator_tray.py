@@ -808,62 +808,48 @@ def convert_selected_text():
 
     # Prevent multiple simultaneous conversions
     if not _conversion_lock.acquire(blocking=False):
-        log_error("convert_selected_text: SKIPPED (already in progress)")
         return False
 
     if _conversion_in_progress:
         _conversion_lock.release()
-        log_error("convert_selected_text: SKIPPED (flag set)")
         return False
 
     _conversion_in_progress = True
-    log_error("convert_selected_text: START")
 
     try:
         hwnd = get_foreground_hwnd()
-        log_error(f"convert_selected_text: hwnd={hwnd}")
 
         # Handle console windows differently
         if is_console_window(hwnd):
             if is_classic_console(hwnd):
-                log_error("convert_selected_text: classic console mode")
                 return convert_in_console(hwnd)
             else:
-                log_error("convert_selected_text: terminal mode")
                 return convert_in_terminal(hwnd)
 
         # Regular application mode
-        log_error("convert_selected_text: regular app mode")
         VK_INSERT = 0x2D
 
         # Small delay to ensure modifiers from hotkey are released
         time.sleep(0.05)
 
         # Clear clipboard first to detect if anything gets copied
-        log_error("convert_selected_text: clearing clipboard")
         clear_clipboard()
 
         # Send Ctrl+X to cut selection (copies and deletes in one step)
-        log_error("convert_selected_text: sending Ctrl+X")
         VK_X = 0x58
         send_ctrl_key(VK_X)
         time.sleep(0.08)  # Wait for cut to complete
 
         # Get cut text from clipboard
-        log_error("convert_selected_text: getting clipboard")
         selected_text = get_clipboard_text()
-        log_error(f"convert_selected_text: clipboard text = {repr(selected_text)[:50] if selected_text else None}")
 
         # If nothing was selected/cut, select backwards to space boundary
         if not selected_text:
-            log_error("convert_selected_text: selecting to space boundary")
             selected_text = select_to_space_boundary()
-            log_error(f"convert_selected_text: selected = {repr(selected_text)[:50] if selected_text else None}")
 
             if selected_text:
                 # Delete selected text with backspaces
                 text_length = len(selected_text)
-                log_error(f"convert_selected_text: deleting {text_length} chars with backspace")
                 VK_BACKSPACE = 0x08
                 for _ in range(text_length):
                     send_key_press(VK_BACKSPACE)
@@ -871,31 +857,25 @@ def convert_selected_text():
                 time.sleep(0.05)
 
         if not selected_text:
-            log_error("convert_selected_text: no text, returning False")
             return False
 
         # Detect source layout and convert
         source_layout = detect_layout(selected_text)
         converted = convert_text(selected_text)
-        log_error(f"convert_selected_text: {source_layout} -> converted")
 
         if converted == selected_text:
-            log_error("convert_selected_text: no change, returning False")
             return False
 
         target_layout = 'ru' if source_layout == 'en' else 'en'
 
         # Put converted text to clipboard and paste
-        log_error("convert_selected_text: pasting converted text")
         set_clipboard_text(converted)
         VK_V = 0x56
         send_ctrl_key(VK_V)
 
         # Switch keyboard layout
-        log_error(f"convert_selected_text: switching layout to {target_layout}")
         time.sleep(0.02)
         switch_keyboard_layout(target_layout)
-        log_error("convert_selected_text: DONE")
         return True
     except Exception as e:
         log_error(f"convert_selected_text: EXCEPTION {e}")
@@ -903,7 +883,6 @@ def convert_selected_text():
     finally:
         _conversion_in_progress = False
         _conversion_lock.release()
-        log_error("convert_selected_text: lock released")
 
 
 class BorderLayer:
@@ -1147,15 +1126,9 @@ class LayoutIndicator:
             except Exception:
                 pass
 
-            # Log window info for debugging crashes (only on window change)
+            # Track window changes
             if window_changed:
                 self._last_logged_hwnd = hwnd
-                try:
-                    window_title = ctypes.create_unicode_buffer(256)
-                    user32.GetWindowTextW(hwnd, window_title, 256)
-                    log_error(f"Window: hwnd={hwnd}, class={current_class}, title={window_title.value[:50]}")
-                except Exception:
-                    pass
 
             # Skip fullscreen check for WPF apps (HwndWrapper) - may cause issues
             if "HwndWrapper" in current_class:
@@ -1356,13 +1329,11 @@ def main():
         print("This script only works on Windows!")
         sys.exit(1)
 
-    log_error("=== Layout Indicator Starting ===")
     print("Layout Indicator Started")
     print(f"Border: {BORDER_THICKNESS}px, Opacity gradient: {BORDER_OPACITY_OUTER} -> {BORDER_OPACITY_INNER}")
     if ENABLE_TEXT_CONVERSION:
         print("Text conversion: Pause/Break or Settings key (select text first)")
     print("Right-click tray icon to exit" if HAS_TRAY else "Press Ctrl+C to exit")
-    print(f"Log file: {LOG_FILE}")
 
     try:
         app = LayoutIndicator()
