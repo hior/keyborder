@@ -70,7 +70,9 @@ RU_TO_EN = str.maketrans(RU_CHARS, EN_CHARS)
 # Hotkey constants
 MOD_NOREPEAT = 0x4000
 VK_PAUSE = 0x13
-HOTKEY_ID_CONVERT = 1
+VK_SETTINGS = 0xFF  # Special settings key (Redmi Book and similar laptops)
+HOTKEY_ID_PAUSE = 1
+HOTKEY_ID_SETTINGS = 2
 WM_HOTKEY = 0x0312
 
 # Layout HKLs for switching (use your preferred EN layout)
@@ -976,20 +978,32 @@ class LayoutIndicator:
         self.root.after(CHECK_INTERVAL_MS, self._check_layout)
 
     def _setup_hotkey(self):
-        """Setup global hotkey for text conversion."""
+        """Setup global hotkeys for text conversion."""
         def hotkey_thread_func():
             # Create a message-only window for receiving hotkey messages
             # We need to register hotkey in the same thread that will process messages
 
+            registered_hotkeys = []
+
             # Register Pause/Break key
-            if not user32.RegisterHotKey(None, HOTKEY_ID_CONVERT,
-                                         MOD_NOREPEAT, VK_PAUSE):
+            if user32.RegisterHotKey(None, HOTKEY_ID_PAUSE, MOD_NOREPEAT, VK_PAUSE):
+                registered_hotkeys.append(('Pause/Break', HOTKEY_ID_PAUSE))
+            else:
                 print("Warning: Failed to register Pause/Break hotkey")
-                print("  It may be already in use by another application")
+
+            # Register Settings key (VK 0xFF - Redmi Book and similar)
+            if user32.RegisterHotKey(None, HOTKEY_ID_SETTINGS, MOD_NOREPEAT, VK_SETTINGS):
+                registered_hotkeys.append(('Settings key', HOTKEY_ID_SETTINGS))
+            else:
+                print("Warning: Failed to register Settings key hotkey")
+
+            if not registered_hotkeys:
+                print("No hotkeys registered - text conversion disabled")
                 return
 
             self.hotkey_registered = True
-            print("Hotkey registered: Pause/Break (convert selected text)")
+            hotkey_names = ' or '.join(name for name, _ in registered_hotkeys)
+            print(f"Hotkey registered: {hotkey_names} (convert selected text)")
 
             # Message structure
             class MSG(ctypes.Structure):
@@ -1003,20 +1017,22 @@ class LayoutIndicator:
                 ]
 
             msg = MSG()
+            hotkey_ids = {hid for _, hid in registered_hotkeys}
 
             # Message loop
             while self.running:
                 # Use PeekMessage with timeout to allow checking self.running
                 PM_REMOVE = 0x0001
                 if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-                    if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID_CONVERT:
+                    if msg.message == WM_HOTKEY and msg.wParam in hotkey_ids:
                         # Run conversion in a separate thread to not block message loop
                         threading.Thread(target=convert_selected_text, daemon=True).start()
                 else:
                     time.sleep(0.05)  # Small sleep to reduce CPU usage
 
-            # Unregister hotkey when done
-            user32.UnregisterHotKey(None, HOTKEY_ID_CONVERT)
+            # Unregister hotkeys when done
+            for _, hid in registered_hotkeys:
+                user32.UnregisterHotKey(None, hid)
 
         self.hotkey_thread = threading.Thread(target=hotkey_thread_func, daemon=True)
         self.hotkey_thread.start()
@@ -1093,7 +1109,7 @@ def main():
     print("Layout Indicator Started")
     print(f"Border: {BORDER_THICKNESS}px, Opacity gradient: {BORDER_OPACITY_OUTER} -> {BORDER_OPACITY_INNER}")
     if ENABLE_TEXT_CONVERSION:
-        print("Text conversion: Pause/Break (select text first)")
+        print("Text conversion: Pause/Break or Settings key (select text first)")
     print("Right-click tray icon to exit" if HAS_TRAY else "Press Ctrl+C to exit")
 
     app = LayoutIndicator()

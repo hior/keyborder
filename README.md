@@ -10,10 +10,11 @@ Windows utility that shows a colored border around the screen based on the curre
 - **Multi-monitor support** — border appears on all connected monitors
 - **Gradient effect** — border fades from edge inward for a subtle look
 - **System tray icon** — colored icon matches current layout, right-click menu
-- **Text conversion** (Pause/Break) — convert selected text between EN↔RU layouts
+- **Text conversion** (Pause/Break or Settings key) — convert selected text between EN↔RU layouts
   - Works like Punto Switcher but without keyboard hooks
   - Auto-selects to space boundary if nothing is selected, correctly handling punctuation (`;`, `,`, `.`, `'`, etc. are treated as word glue)
   - Automatically switches keyboard layout after conversion
+  - Settings key (VK 0xFF) supported for laptops like Redmi Book that have a dedicated settings button
 - **Fullscreen-aware** — border hides in fullscreen apps
 
 ## Installation
@@ -58,14 +59,14 @@ Right-click the tray icon to:
 ### Text Conversion
 
 1. Select text in any application (or just place cursor after a word)
-2. Press `Pause/Break`
+2. Press `Pause/Break` or **Settings key** (on laptops like Redmi Book)
 3. Text is converted and keyboard layout switches automatically
 
-**Example:** Type `ghbdtn` (with EN layout) → press Pause → get `привет` (RU layout active)
+**Example:** Type `ghbdtn` (with EN layout) → press hotkey → get `привет` (RU layout active)
 
 **Terminal support:**
-- **Windows Terminal:** Select text first (double-click on word), then press `Pause/Break`
-- **Classic console (cmd):** Just press `Pause/Break` — reads last word from console buffer
+- **Windows Terminal:** Select text first (double-click on word), then press hotkey
+- **Classic console (cmd):** Just press hotkey — reads last word from console buffer
 
 ## Configuration
 

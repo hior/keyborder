@@ -68,7 +68,7 @@ BORDER_OPACITY_INNER = 0.05  # Opacity at inner edge (fades inward)
 
 5. **Tray icon** — changes color with the border, right-click for menu (Toggle Borders / Exit)
 
-6. **Text conversion** (`Pause/Break` key) — converts selected text between EN↔RU layouts:
+6. **Text conversion** (`Pause/Break` or `Settings key`) — converts selected text between EN↔RU layouts:
    - Select text in any application (or place cursor after a word)
    - Press `Pause/Break`
    - If text is selected: copies, converts, pastes back
@@ -85,8 +85,9 @@ BORDER_OPACITY_INNER = 0.05  # Opacity at inner edge (fades inward)
 ```python
 ENABLE_TEXT_CONVERSION = True  # Set to False to disable
 
-# Hotkey
-VK_PAUSE = 0x13  # Pause/Break key
+# Hotkeys (both trigger text conversion)
+VK_PAUSE = 0x13     # Pause/Break key
+VK_SETTINGS = 0xFF  # Settings key (Redmi Book and similar laptops)
 
 # Target layouts for switching after conversion
 HKL_EN = 0x04090409  # US standard (change to 0xF0010409 for US-Intl)
