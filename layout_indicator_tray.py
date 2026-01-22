@@ -1216,12 +1216,38 @@ class LayoutIndicator:
             msg = MSG()
             hotkey_ids = {hid for _, hid in registered_hotkeys}
 
+            # Navigation key virtual codes for filtering false positives
+            # These can trigger VK 0xFF when Num Lock is on (numpad keys)
+            nav_keys = (
+                0x21,  # VK_PRIOR (Page Up)
+                0x22,  # VK_NEXT (Page Down)
+                0x23,  # VK_END
+                0x24,  # VK_HOME
+                0x25,  # VK_LEFT
+                0x26,  # VK_UP
+                0x27,  # VK_RIGHT
+                0x28,  # VK_DOWN
+                0x2D,  # VK_INSERT
+                0x2E,  # VK_DELETE
+            )
+
+            def is_nav_key_pressed():
+                """Check if any navigation key is currently pressed."""
+                for vk in nav_keys:
+                    # GetAsyncKeyState returns negative (high bit set) if key is pressed
+                    if user32.GetAsyncKeyState(vk) & 0x8000:
+                        return True
+                return False
+
             # Message loop
             while self.running:
                 # Use PeekMessage with timeout to allow checking self.running
                 PM_REMOVE = 0x0001
                 if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                     if msg.message == WM_HOTKEY and msg.wParam in hotkey_ids:
+                        # Filter false positives: VK_SETTINGS (0xFF) can be triggered by nav keys with Num Lock
+                        if msg.wParam == HOTKEY_ID_SETTINGS and is_nav_key_pressed():
+                            continue  # Ignore - this is a false trigger from arrow keys
                         # Run conversion in a separate thread to not block message loop
                         threading.Thread(target=convert_selected_text, daemon=True).start()
                 else:
