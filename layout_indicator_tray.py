@@ -1231,27 +1231,61 @@ class LayoutIndicator:
                 0x2E,  # VK_DELETE
             )
 
-            def is_nav_key_pressed():
-                """Check if any navigation key is currently pressed."""
+            # Track nav key press timestamps from continuous polling
+            nav_key_last_seen = 0.0
+            NAV_KEY_WINDOW = 0.15  # 150ms — if nav key seen within this window, it's a false trigger
+
+            def poll_nav_keys():
+                """Poll nav key states and update last-seen timestamp."""
+                nonlocal nav_key_last_seen
+                now = time.monotonic()
                 for vk in nav_keys:
-                    # GetAsyncKeyState returns negative (high bit set) if key is pressed
-                    if user32.GetAsyncKeyState(vk) & 0x8000:
-                        return True
+                    state = user32.GetAsyncKeyState(vk)
+                    if state & 0x8001:
+                        nav_key_last_seen = now
+
+            def is_false_settings_trigger():
+                """Check if VK_SETTINGS hotkey is a false positive from nav keys.
+
+                Uses three strategies:
+                1. Check if nav key was seen in recent polling (timestamp)
+                2. Check GetAsyncKeyState right now
+                3. Busy-poll for 30ms to catch keys still held
+                """
+                nonlocal nav_key_last_seen
+                now = time.monotonic()
+
+                # Strategy 1: recent polling detected a nav key
+                if now - nav_key_last_seen < NAV_KEY_WINDOW:
+                    return True
+
+                # Strategy 2+3: check now, then busy-poll for 30ms
+                for _ in range(10):
+                    for vk in nav_keys:
+                        state = user32.GetAsyncKeyState(vk)
+                        if state & 0x8001:
+                            nav_key_last_seen = time.monotonic()
+                            return True
+                    time.sleep(0.003)  # 3ms between checks
+
                 return False
 
             # Message loop
             while self.running:
+                # Poll nav keys every iteration to maintain timestamps
+                poll_nav_keys()
+
                 # Use PeekMessage with timeout to allow checking self.running
                 PM_REMOVE = 0x0001
                 if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                     if msg.message == WM_HOTKEY and msg.wParam in hotkey_ids:
-                        # Filter false positives: VK_SETTINGS (0xFF) can be triggered by nav keys with Num Lock
-                        if msg.wParam == HOTKEY_ID_SETTINGS and is_nav_key_pressed():
-                            continue  # Ignore - this is a false trigger from arrow keys
+                        # Filter false positives: VK_SETTINGS (0xFF) can be triggered by nav keys
+                        if msg.wParam == HOTKEY_ID_SETTINGS and is_false_settings_trigger():
+                            continue
                         # Run conversion in a separate thread to not block message loop
                         threading.Thread(target=convert_selected_text, daemon=True).start()
                 else:
-                    time.sleep(0.05)  # Small sleep to reduce CPU usage
+                    time.sleep(0.01)  # 10ms sleep for responsive nav key polling
 
             # Unregister hotkeys when done
             for _, hid in registered_hotkeys:
