@@ -190,35 +190,42 @@ class MONITORINFO(ctypes.Structure):
     ]
 
 
+_MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_bool,
+    ctypes.c_void_p,  # hMonitor
+    ctypes.c_void_p,  # hdcMonitor
+    ctypes.POINTER(RECT),  # lprcMonitor
+    ctypes.c_void_p   # dwData
+)
+
+# Shared list for monitor enum callback to avoid creating closures each call
+_monitor_results = []
+
+def _monitor_enum_callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+    try:
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
+            work = info.rcWork
+            _monitor_results.append((work.left, work.top, work.right, work.bottom))
+    except Exception as e:
+        log_error(f"monitor_enum_callback error: {e}")
+    return True
+
+# Create callback ONCE at module level — prevents leaking C-level ffi closures
+_monitor_callback = _MONITORENUMPROC(_monitor_enum_callback)
+
+
 def get_all_monitors():
     """Get work areas for all monitors."""
-    monitors = []
+    _monitor_results.clear()
 
     try:
-        # Callback function for EnumDisplayMonitors
-        MONITORENUMPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_bool,
-            ctypes.c_void_p,  # hMonitor
-            ctypes.c_void_p,  # hdcMonitor
-            ctypes.POINTER(RECT),  # lprcMonitor
-            ctypes.c_void_p   # dwData
-        )
-
-        def monitor_enum_callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
-            try:
-                info = MONITORINFO()
-                info.cbSize = ctypes.sizeof(MONITORINFO)
-                if user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
-                    work = info.rcWork
-                    monitors.append((work.left, work.top, work.right, work.bottom))
-            except Exception as e:
-                log_error(f"monitor_enum_callback error: {e}")
-            return True
-
-        callback = MONITORENUMPROC(monitor_enum_callback)
-        user32.EnumDisplayMonitors(None, None, callback, 0)
+        user32.EnumDisplayMonitors(None, None, _monitor_callback, 0)
     except Exception as e:
         log_error(f"get_all_monitors error: {e}")
+
+    monitors = list(_monitor_results)
 
     # Return at least primary monitor if enumeration failed
     if not monitors:
@@ -1036,6 +1043,7 @@ class LayoutIndicator:
         self._pending_actions = []  # Thread-safe action queue
         self._borders_lock = threading.Lock()  # Protect borders list
         self._last_logged_hwnd = None  # For debugging window switches
+        self._monitor_check_counter = 0  # Only check monitors every N cycles
 
         # Create borders for all monitors
         self._create_borders()
@@ -1108,27 +1116,19 @@ class LayoutIndicator:
             return
 
         try:
-            # Check if monitor configuration changed
-            monitors = get_all_monitors()
-            if monitors != self.current_monitors:
-                print("Monitor configuration changed, recreating borders...")
-                self._create_borders()
+            # Check if monitor configuration changed (every ~5 seconds, not every 150ms)
+            self._monitor_check_counter += 1
+            if self._monitor_check_counter >= 33:  # 33 * 150ms ≈ 5 seconds
+                self._monitor_check_counter = 0
+                monitors = get_all_monitors()
+                if monitors != self.current_monitors:
+                    print("Monitor configuration changed, recreating borders...")
+                    self._create_borders()
 
             hwnd = get_foreground_hwnd()
-            window_changed = hwnd and self._last_logged_hwnd != hwnd
 
-            # Get window class for debugging
-            current_class = ""
-            try:
-                class_buf = ctypes.create_unicode_buffer(256)
-                user32.GetClassNameW(hwnd, class_buf, 256)
-                current_class = class_buf.value
-            except Exception:
-                pass
-
-            # Track window changes
-            if window_changed:
-                self._last_logged_hwnd = hwnd
+            # Get window class (reuse buffer to avoid allocations every 150ms)
+            current_class = get_window_class(hwnd) if is_valid_hwnd(hwnd) else ""
 
             # Skip fullscreen check for WPF apps (HwndWrapper) - may cause issues
             if "HwndWrapper" in current_class:
@@ -1294,13 +1294,18 @@ class LayoutIndicator:
         self.hotkey_thread = threading.Thread(target=hotkey_thread_func, daemon=True)
         self.hotkey_thread.start()
 
+    _tray_image_cache = {}
+
     def _create_tray_image(self, color):
-        """Create a colored square icon for the tray."""
+        """Create a colored square icon for the tray (cached by color)."""
+        if color in self._tray_image_cache:
+            return self._tray_image_cache[color]
         size = 64
         image = Image.new('RGB', (size, size), color)
         draw = ImageDraw.Draw(image)
         # Add a slight border
         draw.rectangle([0, 0, size-1, size-1], outline='#2c3e50', width=2)
+        self._tray_image_cache[color] = image
         return image
     
     def _setup_tray(self):
