@@ -823,6 +823,9 @@ def convert_selected_text():
 
     _conversion_in_progress = True
 
+    # Save current clipboard contents to restore later
+    saved_clipboard = get_clipboard_text()
+
     try:
         hwnd = get_foreground_hwnd()
 
@@ -888,6 +891,12 @@ def convert_selected_text():
         log_error(f"convert_selected_text: EXCEPTION {e}")
         return False
     finally:
+        # Restore original clipboard contents
+        time.sleep(0.05)
+        if saved_clipboard is not None:
+            set_clipboard_text(saved_clipboard)
+        else:
+            clear_clipboard()
         _conversion_in_progress = False
         _conversion_lock.release()
 
