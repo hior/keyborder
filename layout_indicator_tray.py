@@ -91,6 +91,11 @@ SHOW_ALL_EDGES = True     # True = full frame, False = bottom only
 # Text conversion hotkey (Pause/Break)
 ENABLE_TEXT_CONVERSION = True  # Set to False to disable this feature
 
+# Diagnostic: log scan codes of ambiguous VK 0xFF keys to layout_indicator.log
+# (entries tagged [DIAG]). Useful to find a settings-button scan code on a new
+# laptop — set SETTINGS_SCANCODE accordingly. Leave False for normal use.
+DIAGNOSE_KEYS = False
+
 # ============================================
 
 # Character mapping for EN↔RU conversion (QWERTY ↔ ЙЦУКЕН)
@@ -105,6 +110,12 @@ RU_TO_EN = str.maketrans(RU_CHARS, EN_CHARS)
 MOD_NOREPEAT = 0x4000
 VK_PAUSE = 0x13
 VK_SETTINGS = 0xFF  # Special settings key (Redmi Book and similar laptops)
+
+# VK 0xFF is the "no mapping" virtual code — several physical keys report it
+# (the settings button, the Fn-lock key, numpad nav keys under Num Lock).
+# RegisterHotKey(0xFF) catches all of them, so we disambiguate by scan code:
+# only the real settings button (scan 0x72) should trigger conversion.
+SETTINGS_SCANCODE = 0x72  # Scan code of the dedicated settings/function button
 HOTKEY_ID_PAUSE = 1
 HOTKEY_ID_SETTINGS = 2
 WM_HOTKEY = 0x0312
@@ -338,6 +349,71 @@ class INPUT(ctypes.Structure):
         ('type', wintypes.DWORD),
         ('u', INPUT_UNION),
     ]
+
+
+# ============================================
+# Low-level keyboard hook used to read scan codes of VK 0xFF key presses,
+# so we can tell the settings button apart from Fn-lock / numpad keys.
+# Does NOT swallow keystrokes (always calls CallNextHookEx) -> dead keys safe.
+# ============================================
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+
+# Scan code of the most recent VK 0xFF keydown (set by the hook, read by the
+# hotkey handler to disambiguate which physical key fired).
+_last_settings_scan = None
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ('vkCode', wintypes.DWORD),
+        ('scanCode', wintypes.DWORD),
+        ('flags', wintypes.DWORD),
+        ('time', wintypes.DWORD),
+        ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+_LL_KEYBOARD_PROC = ctypes.WINFUNCTYPE(
+    ctypes.c_long,    # LRESULT
+    ctypes.c_int,     # nCode
+    wintypes.WPARAM,  # wParam
+    wintypes.LPARAM,  # lParam
+)
+
+user32.CallNextHookEx.restype = ctypes.c_long
+user32.CallNextHookEx.argtypes = [
+    wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+]
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
+user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, _LL_KEYBOARD_PROC, wintypes.HINSTANCE, wintypes.DWORD
+]
+
+
+def _ll_keyboard_proc(nCode, wParam, lParam):
+    """Record scan code of VK 0xFF key presses (settings vs Fn-lock/numpad)."""
+    global _last_settings_scan
+    try:
+        if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            # VK 0xFF is the ambiguous code RegisterHotKey(0xFF) catches.
+            if kb.vkCode == 0xFF:
+                _last_settings_scan = kb.scanCode
+                if DIAGNOSE_KEYS:
+                    log_error(
+                        f"[DIAG] VK 0xFF keydown: scan=0x{kb.scanCode:02X} "
+                        f"flags=0x{kb.flags:02X}"
+                    )
+    except Exception as e:
+        log_error(f"_ll_keyboard_proc error: {e}")
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+# Keep a reference so the C callback is not garbage-collected
+_ll_keyboard_proc_ptr = _LL_KEYBOARD_PROC(_ll_keyboard_proc)
 
 
 def get_window_class(hwnd):
@@ -1191,6 +1267,25 @@ class LayoutIndicator:
 
             registered_hotkeys = []
 
+            # Install keyboard hook to read scan codes (no swallow -> dead keys
+            # safe). Lets us tell the settings button apart from Fn-lock/numpad.
+            kbd_hook = None
+            try:
+                kernel32 = ctypes.windll.kernel32
+                kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+                kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+                h_mod = kernel32.GetModuleHandleW(None)
+                kbd_hook = user32.SetWindowsHookExW(
+                    WH_KEYBOARD_LL, _ll_keyboard_proc_ptr, h_mod, 0
+                )
+                if not kbd_hook:
+                    err = kernel32.GetLastError()
+                    log_error(f"Failed to install keyboard hook "
+                              f"(GetLastError={err}) - settings-key scan-code "
+                              f"filter disabled")
+            except Exception as e:
+                log_error(f"Keyboard hook install error: {e}")
+
             # Register Pause/Break key
             if user32.RegisterHotKey(None, HOTKEY_ID_PAUSE, MOD_NOREPEAT, VK_PAUSE):
                 registered_hotkeys.append(('Pause/Break', HOTKEY_ID_PAUSE))
@@ -1225,80 +1320,44 @@ class LayoutIndicator:
             msg = MSG()
             hotkey_ids = {hid for _, hid in registered_hotkeys}
 
-            # Navigation key virtual codes for filtering false positives
-            # These can trigger VK 0xFF when Num Lock is on (numpad keys)
-            nav_keys = (
-                0x21,  # VK_PRIOR (Page Up)
-                0x22,  # VK_NEXT (Page Down)
-                0x23,  # VK_END
-                0x24,  # VK_HOME
-                0x25,  # VK_LEFT
-                0x26,  # VK_UP
-                0x27,  # VK_RIGHT
-                0x28,  # VK_DOWN
-                0x2D,  # VK_INSERT
-                0x2E,  # VK_DELETE
-            )
-
-            # Track nav key press timestamps from continuous polling
-            nav_key_last_seen = 0.0
-            NAV_KEY_WINDOW = 0.15  # 150ms — if nav key seen within this window, it's a false trigger
-
-            def poll_nav_keys():
-                """Poll nav key states and update last-seen timestamp."""
-                nonlocal nav_key_last_seen
-                now = time.monotonic()
-                for vk in nav_keys:
-                    state = user32.GetAsyncKeyState(vk)
-                    if state & 0x8001:
-                        nav_key_last_seen = now
-
             def is_false_settings_trigger():
-                """Check if VK_SETTINGS hotkey is a false positive from nav keys.
+                """True if the VK_SETTINGS hotkey came from a key other than the
+                dedicated settings button (Fn-lock, numpad nav, etc.).
 
-                Uses three strategies:
-                1. Check if nav key was seen in recent polling (timestamp)
-                2. Check GetAsyncKeyState right now
-                3. Busy-poll for 30ms to catch keys still held
+                The keyboard hook records the scan code of the last VK 0xFF
+                keydown; only SETTINGS_SCANCODE is the real button. If the hook
+                isn't installed (scan unknown), don't filter — preserve the
+                key's functionality rather than block it.
                 """
-                nonlocal nav_key_last_seen
-                now = time.monotonic()
-
-                # Strategy 1: recent polling detected a nav key
-                if now - nav_key_last_seen < NAV_KEY_WINDOW:
-                    return True
-
-                # Strategy 2+3: check now, then busy-poll for 30ms
-                for _ in range(10):
-                    for vk in nav_keys:
-                        state = user32.GetAsyncKeyState(vk)
-                        if state & 0x8001:
-                            nav_key_last_seen = time.monotonic()
-                            return True
-                    time.sleep(0.003)  # 3ms between checks
-
-                return False
+                if not kbd_hook:
+                    return False
+                return _last_settings_scan != SETTINGS_SCANCODE
 
             # Message loop
             while self.running:
-                # Poll nav keys every iteration to maintain timestamps
-                poll_nav_keys()
-
                 # Use PeekMessage with timeout to allow checking self.running
                 PM_REMOVE = 0x0001
                 if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                     if msg.message == WM_HOTKEY and msg.wParam in hotkey_ids:
-                        # Filter false positives: VK_SETTINGS (0xFF) can be triggered by nav keys
+                        # VK_SETTINGS (0xFF) fires for several keys — only the
+                        # real settings button (by scan code) should convert.
                         if msg.wParam == HOTKEY_ID_SETTINGS and is_false_settings_trigger():
                             continue
                         # Run conversion in a separate thread to not block message loop
                         threading.Thread(target=convert_selected_text, daemon=True).start()
                 else:
-                    time.sleep(0.01)  # 10ms sleep for responsive nav key polling
+                    time.sleep(0.01)  # 10ms sleep, responsive without busy-spin
 
             # Unregister hotkeys when done
             for _, hid in registered_hotkeys:
                 user32.UnregisterHotKey(None, hid)
+
+            # Remove keyboard hook
+            if kbd_hook:
+                try:
+                    user32.UnhookWindowsHookEx(kbd_hook)
+                except Exception:
+                    pass
 
         self.hotkey_thread = threading.Thread(target=hotkey_thread_func, daemon=True)
         self.hotkey_thread.start()

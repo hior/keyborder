@@ -15,6 +15,7 @@ Windows utility that shows a colored border around the screen based on the curre
   - Auto-selects to space boundary if nothing is selected, correctly handling punctuation (`;`, `,`, `.`, `'`, etc. are treated as word glue)
   - Automatically switches keyboard layout after conversion
   - Settings key (VK 0xFF) supported for laptops like Redmi Book that have a dedicated settings button
+  - A lightweight keyboard hook (read-only, doesn't swallow keys, so dead keys stay safe) reads the scan code of the settings button so that other keys also reporting VK 0xFF (Fn-lock, numpad nav keys) don't trigger conversion by mistake
 - **Fullscreen-aware** — border hides in fullscreen apps
 
 ## Installation
