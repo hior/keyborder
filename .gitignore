@@ -17,3 +17,6 @@ ENV/
 # OS
 Thumbs.db
 .DS_Store
+
+# Runtime logs
+*.log
