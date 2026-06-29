@@ -259,6 +259,30 @@ def get_work_area():
     return rect.left, rect.top, rect.right, rect.bottom
 
 
+def get_resource_counts():
+    """Return (handles, gdi_objects, user_objects) for this process.
+
+    Used to track a slow handle leak: when these climb without bound the
+    process eventually hits WinError 1450 (ERROR_NO_SYSTEM_RESOURCES) and
+    window/timer creation starts failing. Returns (None, None, None) on error.
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        hproc = kernel32.GetCurrentProcess()
+
+        count = wintypes.DWORD(0)
+        kernel32.GetProcessHandleCount(ctypes.c_void_p(hproc), ctypes.byref(count))
+
+        # GR_GDIOBJECTS = 0, GR_USEROBJECTS = 1
+        gdi = user32.GetGuiResources(ctypes.c_void_p(hproc), 0)
+        usr = user32.GetGuiResources(ctypes.c_void_p(hproc), 1)
+        return count.value, gdi, usr
+    except Exception as e:
+        log_error(f"get_resource_counts error: {e}")
+        return None, None, None
+
+
 def is_fullscreen(hwnd):
     """Check if the given window is fullscreen."""
     if not is_valid_hwnd(hwnd):
@@ -362,8 +386,19 @@ WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
 
 # Scan code of the most recent VK 0xFF keydown (set by the hook, read by the
-# hotkey handler to disambiguate which physical key fired).
+# hotkey handler to disambiguate which physical key fired). Paired with a
+# timestamp so the hotkey handler can reject a *stale* value: if Windows
+# silently drops the low-level hook (it does this when a callback ever exceeds
+# LowLevelHooksTimeout), this global stops updating and goes stale — without the
+# freshness check a frozen 0x72 would let every VK 0xFF key (numpad nav keys,
+# Fn-lock) falsely trigger conversion.
 _last_settings_scan = None
+_last_settings_scan_time = 0.0
+
+# A genuine settings-button keydown lands microseconds before its WM_HOTKEY, so
+# the recorded scan should be a few ms old at most. Anything older means the
+# hook didn't record this keypress (dropped hook / different key) -> don't trust it.
+SETTINGS_SCAN_FRESH_SEC = 0.5
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -392,16 +427,27 @@ user32.SetWindowsHookExW.argtypes = [
     ctypes.c_int, _LL_KEYBOARD_PROC, wintypes.HINSTANCE, wintypes.DWORD
 ]
 
+# Block the hotkey thread on the message queue instead of busy-polling with
+# time.sleep (which created a waitable-timer handle ~100x/sec — the canary that
+# first failed with WinError 1450 under resource pressure).
+user32.MsgWaitForMultipleObjectsEx.restype = wintypes.DWORD
+user32.MsgWaitForMultipleObjectsEx.argtypes = [
+    wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD
+]
+QS_ALLINPUT = 0x04FF           # wake on any input incl. QS_HOTKEY / posted msgs
+MWMO_INPUTAVAILABLE = 0x0004
+
 
 def _ll_keyboard_proc(nCode, wParam, lParam):
     """Record scan code of VK 0xFF key presses (settings vs Fn-lock/numpad)."""
-    global _last_settings_scan
+    global _last_settings_scan, _last_settings_scan_time
     try:
         if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             # VK 0xFF is the ambiguous code RegisterHotKey(0xFF) catches.
             if kb.vkCode == 0xFF:
                 _last_settings_scan = kb.scanCode
+                _last_settings_scan_time = time.time()
                 if DIAGNOSE_KEYS:
                     log_error(
                         f"[DIAG] VK 0xFF keydown: scan=0x{kb.scanCode:02X} "
@@ -414,6 +460,29 @@ def _ll_keyboard_proc(nCode, wParam, lParam):
 
 # Keep a reference so the C callback is not garbage-collected
 _ll_keyboard_proc_ptr = _LL_KEYBOARD_PROC(_ll_keyboard_proc)
+
+
+def install_kbd_hook():
+    """Install the low-level keyboard hook. Returns the hook handle or None.
+
+    Must be called from a thread that pumps messages (the hotkey thread).
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        h_mod = kernel32.GetModuleHandleW(None)
+        hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, _ll_keyboard_proc_ptr, h_mod, 0
+        )
+        if not hook:
+            err = kernel32.GetLastError()
+            log_error(f"Failed to install keyboard hook (GetLastError={err})")
+            return None
+        return hook
+    except Exception as e:
+        log_error(f"Keyboard hook install error: {e}")
+        return None
 
 
 def get_window_class(hwnd):
@@ -984,6 +1053,8 @@ class BorderLayer:
         self.window = None
         self.canvas = None
         self.base_alpha = alpha
+        self.color = color          # last color applied to the canvas
+        self._applied_alpha = alpha  # last alpha applied to the window
 
         try:
             self.window = tk.Toplevel(master)
@@ -1037,6 +1108,7 @@ class BorderLayer:
             return
         try:
             self.canvas.configure(bg=color)
+            self.color = color
         except (tk.TclError, RuntimeError):
             pass  # Window may be destroyed
 
@@ -1045,8 +1117,42 @@ class BorderLayer:
             return
         try:
             self.window.attributes('-alpha', alpha)
+            self._applied_alpha = alpha
         except (tk.TclError, RuntimeError):
             pass  # Window may be destroyed
+
+    def is_alive(self):
+        """True if the underlying tk window/canvas still exist."""
+        try:
+            return bool(self.window) and bool(self.window.winfo_exists()) and \
+                   bool(self.canvas) and bool(self.canvas.winfo_exists())
+        except (tk.TclError, RuntimeError):
+            return False
+
+    def reassert_topmost(self):
+        """Re-apply always-on-top so the border can't get stuck behind a
+        window that briefly stole the top z-order."""
+        if not self.window:
+            return
+        try:
+            self.window.attributes('-topmost', True)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def enforce(self, color, visible):
+        """Idempotently re-assert desired color/alpha/topmost (self-healing).
+
+        Only issues a tk call when the value actually drifted, so this is cheap
+        to run on every watchdog tick.
+        """
+        if not self.window:
+            return
+        target_alpha = self.base_alpha if visible else 0.0
+        if color != self.color:
+            self.set_color(color)
+        if abs(self._applied_alpha - target_alpha) > 1e-3:
+            self.set_alpha(target_alpha)
+        self.reassert_topmost()
 
     def destroy(self):
         if not self.window:
@@ -1103,6 +1209,15 @@ class BorderWindow:
             alpha = layer.base_alpha if visible else 0.0
             layer.set_alpha(alpha)
 
+    def is_alive(self):
+        """True only if every layer window still exists."""
+        return bool(self.layers) and all(layer.is_alive() for layer in self.layers)
+
+    def enforce(self, color, visible):
+        """Re-assert desired state on all layers (self-healing watchdog)."""
+        for layer in self.layers:
+            layer.enforce(color, visible)
+
     def destroy(self):
         for layer in self.layers:
             layer.destroy()
@@ -1121,6 +1236,10 @@ class LayoutIndicator:
         self.running = True
         self.tray_icon = None
         self.borders_visible = True
+        # Runtime on/off for text conversion (toggled from the tray menu).
+        # The hotkey thread still runs; this just gates whether a hotkey
+        # actually performs a conversion.
+        self.conversion_enabled = ENABLE_TEXT_CONVERSION
         self.fullscreen_hidden = False  # Track if hidden due to fullscreen
         self.current_monitors = None  # Track monitor configuration
         self.hotkey_registered = False
@@ -1129,9 +1248,15 @@ class LayoutIndicator:
         self._borders_lock = threading.Lock()  # Protect borders list
         self._last_logged_hwnd = None  # For debugging window switches
         self._monitor_check_counter = 0  # Only check monitors every N cycles
+        self._watchdog_counter = 0  # Re-assert border state every N cycles
+        self._resource_log_counter = 0  # Log handle/GDI/USER counts every N cycles
+        self._resource_baseline = None  # First (handles, gdi, user) sample
 
         # Create borders for all monitors
         self._create_borders()
+
+        # Record a resource-count baseline so periodic samples show real growth
+        self._log_resource_counts()
 
         # Start layout checking
         self._check_layout()
@@ -1168,32 +1293,76 @@ class LayoutIndicator:
     def _create_borders(self):
         """Create border windows for all monitors."""
         with self._borders_lock:
-            # Destroy existing borders
+            self._create_borders_locked()
+
+    def _create_borders_locked(self):
+        """Create border windows for all monitors. Caller must hold _borders_lock."""
+        # Destroy existing borders
+        for border in self.borders:
+            try:
+                border.destroy()
+            except Exception as e:
+                print(f"Error destroying border: {e}")
+        self.borders = []
+
+        # Determine which edges to show
+        edges = ['top', 'bottom', 'left', 'right'] if SHOW_ALL_EDGES else ['bottom']
+
+        # Get all monitors and create borders for each
+        self.current_monitors = get_all_monitors()
+        print(f"Found {len(self.current_monitors)} monitor(s)")
+
+        color = self.current_color or DEFAULT_COLOR[0]
+        for work_area in self.current_monitors:
+            for edge in edges:
+                try:
+                    border = BorderWindow(self.root, edge, color, work_area)
+                    # Respect current visibility state
+                    if not self.borders_visible or self.fullscreen_hidden:
+                        border.set_visible(False)
+                    self.borders.append(border)
+                except Exception as e:
+                    print(f"Error creating border {edge}: {e}")
+
+    def _enforce_border_state(self):
+        """Watchdog: re-assert the desired border state every tick so the
+        indicator self-heals.
+
+        The rest of _check_layout is edge-triggered (it only acts when the
+        layout/fullscreen state *changes*), and every tk failure is swallowed.
+        That means a single missed/failed update — during a resource-pressure
+        blip, a transient TclError, a missed fullscreen-exit, or a monitor
+        flap — would otherwise leave the border stuck (invisible / wrong color
+        / behind another window) until the app is restarted. Re-asserting the
+        level state here recovers automatically once the transient passes.
+        """
+        desired_visible = self.borders_visible and not self.fullscreen_hidden
+        color = self.current_color or DEFAULT_COLOR[0]
+        with self._borders_lock:
+            # If any border window was destroyed/lost, rebuild the whole set.
+            if not self.borders or any(not b.is_alive() for b in self.borders):
+                log_error("Watchdog: border window(s) missing, recreating")
+                self._create_borders_locked()
+                return
             for border in self.borders:
                 try:
-                    border.destroy()
-                except Exception as e:
-                    print(f"Error destroying border: {e}")
-            self.borders = []
+                    border.enforce(color, desired_visible)
+                except Exception:
+                    pass
 
-            # Determine which edges to show
-            edges = ['top', 'bottom', 'left', 'right'] if SHOW_ALL_EDGES else ['bottom']
-
-            # Get all monitors and create borders for each
-            self.current_monitors = get_all_monitors()
-            print(f"Found {len(self.current_monitors)} monitor(s)")
-
-            color = self.current_color or DEFAULT_COLOR[0]
-            for work_area in self.current_monitors:
-                for edge in edges:
-                    try:
-                        border = BorderWindow(self.root, edge, color, work_area)
-                        # Respect current visibility state
-                        if not self.borders_visible or self.fullscreen_hidden:
-                            border.set_visible(False)
-                        self.borders.append(border)
-                    except Exception as e:
-                        print(f"Error creating border {edge}: {e}")
+    def _log_resource_counts(self):
+        """Periodically log handle/GDI/USER counts to spot the slow leak."""
+        handles, gdi, usr = get_resource_counts()
+        if handles is None:
+            return
+        if self._resource_baseline is None:
+            self._resource_baseline = (handles, gdi, usr)
+        b = self._resource_baseline
+        log_error(
+            f"[RES] handles={handles} gdi={gdi} user={usr} "
+            f"(delta since start: handles={handles - b[0]:+d} "
+            f"gdi={gdi - b[1]:+d} user={usr - b[2]:+d})"
+        )
     
     def _check_layout(self):
         """Periodically check keyboard layout."""
@@ -1254,6 +1423,19 @@ class LayoutIndicator:
                     # Update tray icon color
                     if self.tray_icon and HAS_TRAY:
                         self._update_tray_icon(color, name)
+
+            # Watchdog: re-assert the desired border state so a single missed
+            # update can't leave the border stuck until restart (~1s cadence).
+            self._watchdog_counter += 1
+            if self._watchdog_counter >= 7:  # 7 * 150ms ≈ 1 second
+                self._watchdog_counter = 0
+                self._enforce_border_state()
+
+            # Periodically log resource counts to catch the slow handle leak.
+            self._resource_log_counter += 1
+            if self._resource_log_counter >= 2000:  # 2000 * 150ms ≈ 5 minutes
+                self._resource_log_counter = 0
+                self._log_resource_counts()
         except Exception as e:
             log_error(f"Error in _check_layout: {e}")
 
@@ -1269,22 +1451,12 @@ class LayoutIndicator:
 
             # Install keyboard hook to read scan codes (no swallow -> dead keys
             # safe). Lets us tell the settings button apart from Fn-lock/numpad.
-            kbd_hook = None
-            try:
-                kernel32 = ctypes.windll.kernel32
-                kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-                kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-                h_mod = kernel32.GetModuleHandleW(None)
-                kbd_hook = user32.SetWindowsHookExW(
-                    WH_KEYBOARD_LL, _ll_keyboard_proc_ptr, h_mod, 0
-                )
-                if not kbd_hook:
-                    err = kernel32.GetLastError()
-                    log_error(f"Failed to install keyboard hook "
-                              f"(GetLastError={err}) - settings-key scan-code "
-                              f"filter disabled")
-            except Exception as e:
-                log_error(f"Keyboard hook install error: {e}")
+            # Kept in a dict so the periodic self-heal below (and the filter
+            # closure) always see the current handle.
+            _hook_state = {'handle': install_kbd_hook()}
+            if not _hook_state['handle']:
+                log_error("settings-key scan-code filter disabled "
+                          "(hook install failed)")
 
             # Register Pause/Break key
             if user32.RegisterHotKey(None, HOTKEY_ID_PAUSE, MOD_NOREPEAT, VK_PAUSE):
@@ -1324,38 +1496,88 @@ class LayoutIndicator:
                 """True if the VK_SETTINGS hotkey came from a key other than the
                 dedicated settings button (Fn-lock, numpad nav, etc.).
 
-                The keyboard hook records the scan code of the last VK 0xFF
-                keydown; only SETTINGS_SCANCODE is the real button. If the hook
-                isn't installed (scan unknown), don't filter — preserve the
-                key's functionality rather than block it.
-                """
-                if not kbd_hook:
-                    return False
-                return _last_settings_scan != SETTINGS_SCANCODE
+                The keyboard hook records the scan code (and time) of the last
+                VK 0xFF keydown; only SETTINGS_SCANCODE is the real button.
 
-            # Message loop
+                Fail-safe rules so a stale value can't cause false triggers:
+                - The scan must be FRESH (recorded within SETTINGS_SCAN_FRESH_SEC).
+                  A genuine press records the scan just before its WM_HOTKEY; a
+                  stale value means the hook didn't see this keypress (e.g.
+                  Windows silently dropped the hook), so we must NOT trust it.
+                - The value is CONSUMED after reading, so it can never authorize
+                  a second, different keypress.
+                - If the hook isn't installed at all (scan permanently unknown),
+                  don't filter — preserve the key's functionality.
+                """
+                global _last_settings_scan
+                if not _hook_state['handle']:
+                    return False  # no hook -> can't filter, allow
+                scan = _last_settings_scan
+                age = time.time() - _last_settings_scan_time
+                _last_settings_scan = None  # consume so it can't be reused
+                if scan is None or age > SETTINGS_SCAN_FRESH_SEC:
+                    return True  # stale/missing -> treat as false trigger
+                return scan != SETTINGS_SCANCODE
+
+            # Message loop. Each iteration is wrapped so a transient OSError
+            # (e.g. WinError 1450 under resource pressure) can't kill the
+            # thread and permanently disable text conversion.
+            PM_REMOVE = 0x0001
+            reinstall_counter = 0
             while self.running:
-                # Use PeekMessage with timeout to allow checking self.running
-                PM_REMOVE = 0x0001
-                if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-                    if msg.message == WM_HOTKEY and msg.wParam in hotkey_ids:
-                        # VK_SETTINGS (0xFF) fires for several keys — only the
-                        # real settings button (by scan code) should convert.
-                        if msg.wParam == HOTKEY_ID_SETTINGS and is_false_settings_trigger():
-                            continue
-                        # Run conversion in a separate thread to not block message loop
-                        threading.Thread(target=convert_selected_text, daemon=True).start()
-                else:
-                    time.sleep(0.01)  # 10ms sleep, responsive without busy-spin
+                try:
+                    # Block up to 100ms for input/messages instead of busy-polling.
+                    # Wakes immediately on WM_HOTKEY (QS_HOTKEY ⊂ QS_ALLINPUT);
+                    # the 100ms timeout lets us re-check self.running for shutdown.
+                    user32.MsgWaitForMultipleObjectsEx(
+                        0, None, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE
+                    )
+
+                    # Self-heal: Windows silently removes a low-level hook whose
+                    # callback ever exceeds LowLevelHooksTimeout (can happen when
+                    # the GIL is held during a conversion). There's no event for
+                    # this, so periodically reinstall. Install the new hook first,
+                    # then drop the old handle, so we're never left without one.
+                    reinstall_counter += 1
+                    if reinstall_counter >= 50:  # ~50 * 100ms ≈ 5 seconds
+                        reinstall_counter = 0
+                        new_hook = install_kbd_hook()
+                        if new_hook:
+                            old_hook = _hook_state['handle']
+                            _hook_state['handle'] = new_hook
+                            if old_hook:
+                                try:
+                                    user32.UnhookWindowsHookEx(old_hook)
+                                except Exception:
+                                    pass
+
+                    while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                        if msg.message == WM_HOTKEY and msg.wParam in hotkey_ids:
+                            # Respect the runtime menu toggle.
+                            if not self.conversion_enabled:
+                                continue
+                            # VK_SETTINGS (0xFF) fires for several keys — only the
+                            # real settings button (by scan code) should convert.
+                            if msg.wParam == HOTKEY_ID_SETTINGS and is_false_settings_trigger():
+                                continue
+                            # Run conversion in a thread so it can't block the loop
+                            threading.Thread(target=convert_selected_text, daemon=True).start()
+                except Exception as e:
+                    log_error(f"hotkey loop iteration error: {e}")
+                    # Back off briefly without dying; tolerate sleep also failing.
+                    try:
+                        time.sleep(0.1)
+                    except Exception:
+                        pass
 
             # Unregister hotkeys when done
             for _, hid in registered_hotkeys:
                 user32.UnregisterHotKey(None, hid)
 
             # Remove keyboard hook
-            if kbd_hook:
+            if _hook_state['handle']:
                 try:
-                    user32.UnhookWindowsHookEx(kbd_hook)
+                    user32.UnhookWindowsHookEx(_hook_state['handle'])
                 except Exception:
                     pass
 
@@ -1406,10 +1628,23 @@ class LayoutIndicator:
                                 pass
             self._schedule_action(do_toggle)
 
-        menu = pystray.Menu(
-            pystray.MenuItem('Toggle Borders', toggle_borders),
-            pystray.MenuItem('Exit', on_quit)
-        )
+        def toggle_conversion(icon, item):
+            # Flip the runtime flag. Read by the hotkey loop before converting.
+            self.conversion_enabled = not self.conversion_enabled
+
+        menu_items = [pystray.MenuItem('Toggle Borders', toggle_borders)]
+
+        # Only offer the conversion switch if the feature is enabled in config
+        # (otherwise the hotkey thread isn't running and the toggle is a no-op).
+        if ENABLE_TEXT_CONVERSION:
+            menu_items.append(pystray.MenuItem(
+                'Enable Text Conversion',
+                toggle_conversion,
+                checked=lambda item: self.conversion_enabled
+            ))
+
+        menu_items.append(pystray.MenuItem('Exit', on_quit))
+        menu = pystray.Menu(*menu_items)
 
         image = self._create_tray_image(self.current_color or DEFAULT_COLOR[0])
         self.tray_icon = pystray.Icon(

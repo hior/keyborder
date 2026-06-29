@@ -14,8 +14,9 @@ Windows utility that shows a colored border around the screen based on the curre
   - Works like Punto Switcher but without keyboard hooks
   - Auto-selects to space boundary if nothing is selected, correctly handling punctuation (`;`, `,`, `.`, `'`, etc. are treated as word glue)
   - Automatically switches keyboard layout after conversion
+  - Can be turned on/off at runtime from the tray menu (**Enable Text Conversion**)
   - Settings key (VK 0xFF) supported for laptops like Redmi Book that have a dedicated settings button
-  - A lightweight keyboard hook (read-only, doesn't swallow keys, so dead keys stay safe) reads the scan code of the settings button so that other keys also reporting VK 0xFF (Fn-lock, numpad nav keys) don't trigger conversion by mistake
+  - A lightweight keyboard hook (read-only, doesn't swallow keys, so dead keys stay safe) reads the scan code of the settings button so that other keys also reporting VK 0xFF (Fn-lock, numpad nav keys) don't trigger conversion by mistake. The scan-code filter is fail-safe: it only fires on a *fresh* scan code that it consumes after use, and the hook is reinstalled periodically (every ~5s) so it self-heals if Windows silently drops it — preventing false triggers on numpad cursor keys
 - **Fullscreen-aware** — border hides in fullscreen apps
 
 ## Installation
@@ -55,6 +56,7 @@ The border color changes automatically when you switch keyboard layouts:
 
 Right-click the tray icon to:
 - Toggle border visibility
+- Enable/disable text conversion (checkbox)
 - Exit the application
 
 ### Text Conversion
@@ -118,6 +120,13 @@ Place a shortcut to this file in `shell:startup` (Win+R → `shell:startup`).
 - Creates transparent click-through windows using `WS_EX_LAYERED | WS_EX_TRANSPARENT`
 - Text conversion uses `RegisterHotKey()` — not a keyboard hook, so it doesn't interfere with dead keys or other input methods
 - Gradient effect achieved by stacking multiple 1px windows with varying opacity
+- A watchdog (~1s) re-asserts each border's color/opacity/always-on-top and recreates any
+  border window that was destroyed, so the indicator self-heals instead of staying blank
+  until restart after a transient glitch (resource pressure, lost z-order, monitor flap)
+- The hotkey thread blocks on the message queue (`MsgWaitForMultipleObjectsEx`) and survives
+  transient `WinError 1450` errors, so text conversion can't be permanently disabled
+- Handle/GDI/USER counts are logged to `layout_indicator.log` at startup and every ~5 min
+  (`[RES]` lines) to help track down resource leaks
 
 ## Why no keyboard hooks?
 

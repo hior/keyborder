@@ -66,7 +66,7 @@ BORDER_OPACITY_INNER = 0.05  # Opacity at inner edge (fades inward)
 
 4. **Click-through windows** — uses styles `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
 
-5. **Tray icon** — changes color with the border, right-click for menu (Toggle Borders / Exit)
+5. **Tray icon** — changes color with the border, right-click for menu (Toggle Borders / Enable Text Conversion / Exit)
 
 6. **Text conversion** (`Pause/Break` or `Settings key`) — converts selected text between EN↔RU layouts:
    - Select text in any application (or place cursor after a word)
